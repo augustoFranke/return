@@ -1,0 +1,6 @@
+.build/
+.dmg-staging/
+AppIcon.iconset/
+Return.app/
+Return.dmg
+.DS_Store
