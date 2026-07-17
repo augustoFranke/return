@@ -7,8 +7,8 @@ yourself while you speak, sing, stream, or record — without paying for a
 closed-source monitor utility.
 
 It is designed for **one of the smallest software delays** among open-source
-projects with the same purpose: native Core Audio HAL I/O, 32-frame device
-buffers when the hardware allows, and a lock-free C ring buffer that keeps the
+projects with the same purpose: native Core Audio HAL I/O, device-minimum
+buffers (often 15 frames), and a lock-free C ring buffer that keeps the
 software bridge tight.
 
 ## Why Return is fast
@@ -19,13 +19,21 @@ buffers. Return goes lower:
 | Design choice | What it does |
 | --- | --- |
 | Core Audio **HAL** units | Direct input/output paths, no AVAudioEngine graph overhead |
-| Preferred **32-frame** buffers | ~0.7 ms per buffer at 48 kHz when the device accepts it |
-| Compact software bridge | Target fill ≈ 4× the larger device buffer (often ~128 frames) |
+| **Device-minimum** buffers | Asks each device for its smallest buffer (often 15 frames ≈ 0.3 ms at 48 kHz) |
+| Adaptive software bridge | Target fill starts at input + output buffer (often ~30 frames) and grows only if the machine underruns |
+| Same-device passthrough | Mic and output on the same device: one HAL unit, one IO cycle, no jitter buffer at all |
 | Lock-free C ring buffer | Capture and render callbacks stay light and real-time safe |
 
 On cooperative hardware, that stack is among the **lowest-latency open-source
 software monitors** available for macOS — close enough that the remaining delay
 is mostly the interface, converters, and headphones themselves.
+
+Measured on an M-series MacBook Pro with a USB interface at 48 kHz: 15-frame
+device buffers on both sides and a steady bridge fill of ~22–30 frames, for a
+software path of roughly **1.3 ms** (down from ~4 ms in Return 1.0). With mic
+and output on one duplex device, the bridge collapses to a single IO cycle
+(~0.3 ms). If a machine can't sustain that margin, the bridge widens itself in
+1.5× steps instead of crackling — latency stays as low as the hardware allows.
 
 > Actual latency depends on your interface and sample rate. Return requests the
 > smallest buffer size the device will take and restores the previous sizes when
@@ -84,8 +92,11 @@ swift test
 
 ```
 Microphone ──► AUHAL input ──► C ring buffer ──► AUHAL output ──► Headphones
-                 (32 frames)   (target fill)       (32 frames)
+                (device min)  (adaptive fill)     (device min)
 ```
+
+When the default input and output are the same device, Return collapses this
+to a single AUHAL unit and copies mic to output inside one IO cycle.
 
 Sources live under `Sources/` (Swift UI + HAL bridge) and `NativeAudio/` (C ring
 buffer). See `Package.swift` for the SwiftPM layout.

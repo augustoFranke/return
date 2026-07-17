@@ -7,7 +7,8 @@
 struct ReturnAudioRing {
     float *samples;
     uint32_t capacity;
-    uint32_t target;
+    uint32_t initial_target;
+    _Atomic uint32_t target;
     _Atomic uint64_t write_index;
     _Atomic uint64_t read_index;
     _Atomic float volume;
@@ -75,8 +76,15 @@ static void resample_consume(
     atomic_store_explicit(&ring->last_sample, last, memory_order_relaxed);
 }
 
+// Growth is capped at capacity/2 so a grown target still leaves write headroom.
+static uint32_t grown_target(const ReturnAudioRing *ring, uint32_t target) {
+    uint32_t grown = target + (target + 1) / 2;
+    const uint32_t cap = ring->capacity / 2;
+    return grown > cap ? cap : grown;
+}
+
 ReturnAudioRing *return_audio_ring_create(uint32_t capacity_frames, uint32_t target_frames) {
-    if (capacity_frames < 4 || target_frames >= capacity_frames) {
+    if (capacity_frames < 4 || target_frames >= capacity_frames / 2) {
         return NULL;
     }
 
@@ -92,7 +100,8 @@ ReturnAudioRing *return_audio_ring_create(uint32_t capacity_frames, uint32_t tar
     }
 
     ring->capacity = capacity_frames;
-    ring->target = target_frames;
+    ring->initial_target = target_frames;
+    atomic_init(&ring->target, target_frames);
     atomic_init(&ring->volume, 1.0f);
     atomic_init(&ring->last_sample, 0.0f);
     return ring;
@@ -112,6 +121,7 @@ void return_audio_ring_reset(ReturnAudioRing *ring) {
     }
     atomic_store_explicit(&ring->write_index, 0, memory_order_relaxed);
     atomic_store_explicit(&ring->read_index, 0, memory_order_relaxed);
+    atomic_store_explicit(&ring->target, ring->initial_target, memory_order_relaxed);
     atomic_store_explicit(&ring->last_sample, 0.0f, memory_order_relaxed);
     atomic_store_explicit(&ring->started, false, memory_order_relaxed);
     atomic_store_explicit(&ring->underflows, 0, memory_order_relaxed);
@@ -172,10 +182,11 @@ void return_audio_ring_render(ReturnAudioRing *ring, float *output, uint32_t fra
     update_maximum(&ring->maximum_render_frames, frame_count);
 
     const float volume = atomic_load_explicit(&ring->volume, memory_order_relaxed);
+    const uint32_t target = atomic_load_explicit(&ring->target, memory_order_relaxed);
     uint64_t available = available_frames(ring);
     bool started = atomic_load_explicit(&ring->started, memory_order_relaxed);
     if (!started) {
-        if (available < ring->target) {
+        if (available < target) {
             fill_with_sample(
                 output, frame_count,
                 atomic_load_explicit(&ring->last_sample, memory_order_relaxed),
@@ -203,16 +214,23 @@ void return_audio_ring_render(ReturnAudioRing *ring, float *output, uint32_t fra
         if (available > 0) {
             atomic_store_explicit(&ring->read_index, read + available, memory_order_release);
         }
+        // An underflow means the jitter margin was too small for this machine:
+        // widen it and re-prime. target == 0 is the same-cycle passthrough mode,
+        // where underflow only signals missing input, so no margin exists to grow.
+        if (target > 0) {
+            atomic_store_explicit(&ring->target, grown_target(ring, target), memory_order_relaxed);
+            atomic_store_explicit(&ring->started, false, memory_order_relaxed);
+        }
         return;
     }
 
     uint32_t consume = frame_count;
     // Band scales with target so stretch still works when target is small.
-    const uint32_t correction_band = ring->target > 4 ? ring->target / 4 : 1;
-    if (available > (uint64_t)ring->target + correction_band && available > frame_count) {
+    const uint32_t correction_band = target > 4 ? target / 4 : 1;
+    if (available > (uint64_t)target + correction_band && available > frame_count) {
         consume = frame_count + 1;
         atomic_fetch_add_explicit(&ring->shortened_reads, 1, memory_order_relaxed);
-    } else if (available + correction_band < ring->target && frame_count > 1) {
+    } else if (available + correction_band < target && frame_count > 1) {
         consume = frame_count - 1;
         atomic_fetch_add_explicit(&ring->stretched_reads, 1, memory_order_relaxed);
     }
@@ -228,6 +246,7 @@ ReturnAudioRingStats return_audio_ring_stats(const ReturnAudioRing *ring) {
         return stats;
     }
     stats.fill_frames = (uint32_t)available_frames(ring);
+    stats.target_frames = atomic_load_explicit(&ring->target, memory_order_relaxed);
     stats.underflows = atomic_load_explicit(&ring->underflows, memory_order_relaxed);
     stats.overflows = atomic_load_explicit(&ring->overflows, memory_order_relaxed);
     stats.shortened_reads = atomic_load_explicit(&ring->shortened_reads, memory_order_relaxed);

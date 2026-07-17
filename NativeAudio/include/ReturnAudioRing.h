@@ -12,6 +12,7 @@ typedef struct ReturnAudioRing ReturnAudioRing;
 
 typedef struct {
     uint32_t fill_frames;
+    uint32_t target_frames;
     uint64_t underflows;
     uint64_t overflows;
     uint64_t shortened_reads;

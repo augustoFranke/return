@@ -9,11 +9,11 @@ private let inputAvailableCallback: AURenderCallback = { userData, _, timestamp,
         .captureInput(timestamp: timestamp, frameCount: frameCount)
 }
 
-private let outputRenderCallback: AURenderCallback = { userData, _, _, _, frameCount, ioData in
+private let outputRenderCallback: AURenderCallback = { userData, _, timestamp, _, frameCount, ioData in
     guard let ioData else { return kAudio_ParamError }
     return Unmanaged<HALAudioBridge>.fromOpaque(userData)
         .takeUnretainedValue()
-        .renderOutput(frameCount: frameCount, ioData: ioData)
+        .renderOutput(timestamp: timestamp, frameCount: frameCount, ioData: ioData)
 }
 
 final class HALAudioBridge {
@@ -24,6 +24,7 @@ final class HALAudioBridge {
         let outputBufferFrames: UInt32
         let bridgeTargetFrames: UInt32
         let sampleRate: Double
+        let passthrough: Bool
     }
 
     enum BridgeError: LocalizedError {
@@ -51,6 +52,7 @@ final class HALAudioBridge {
 
     private var inputUnit: AudioUnit?
     private var outputUnit: AudioUnit?
+    private var isPassthrough = false
     private var ring: OpaquePointer?
     private var inputScratch: UnsafeMutablePointer<Float>?
     private var outputScratch: UnsafeMutablePointer<Float>?
@@ -80,9 +82,14 @@ final class HALAudioBridge {
                 throw BridgeError.incompatibleSampleRates(input: inputRate, output: outputRate)
             }
 
-            let inputFrames = try setBufferFrames(inputDevice, preferredFrames: 32)
-            let outputFrames = try setBufferFrames(outputDevice, preferredFrames: 32)
-            let targetFrames = max(inputFrames, outputFrames) * 4
+            let passthrough = inputDevice == outputDevice
+            let inputFrames = try setBufferFrames(inputDevice)
+            let outputFrames = passthrough ? inputFrames : try setBufferFrames(outputDevice)
+            // Same device means one clock and one IO cycle: input can feed output
+            // directly, so no jitter margin is needed. Independent devices need at
+            // least one input plus one output buffer to absorb callback phasing;
+            // the ring grows this on its own if the machine underruns.
+            let targetFrames = passthrough ? 0 : inputFrames + outputFrames
 
             guard let ring = return_audio_ring_create(16_384, targetFrames) else {
                 throw BridgeError.allocationFailed
@@ -95,16 +102,25 @@ final class HALAudioBridge {
             inputScratch?.initialize(repeating: 0, count: Int(maximumFrames))
             outputScratch?.initialize(repeating: 0, count: Int(maximumFrames))
 
-            inputUnit = try makeHALUnit(device: inputDevice, inputEnabled: true, outputEnabled: false)
-            outputUnit = try makeHALUnit(device: outputDevice, inputEnabled: false, outputEnabled: true)
+            isPassthrough = passthrough
+            if passthrough {
+                let unit = try makeHALUnit(device: inputDevice, inputEnabled: true, outputEnabled: true)
+                outputUnit = unit
+                try configureDuplexUnit(unit, sampleRate: inputRate, maximumFrames: inputFrames)
+                try check(AudioUnitInitialize(unit), "Initialize duplex HAL")
+                try check(AudioOutputUnitStart(unit), "Start duplex HAL")
+            } else {
+                inputUnit = try makeHALUnit(device: inputDevice, inputEnabled: true, outputEnabled: false)
+                outputUnit = try makeHALUnit(device: outputDevice, inputEnabled: false, outputEnabled: true)
 
-            try configureInputUnit(sampleRate: inputRate, maximumFrames: inputFrames)
-            try configureOutputUnit(sampleRate: outputRate, maximumFrames: outputFrames)
+                try configureInputUnit(sampleRate: inputRate, maximumFrames: inputFrames)
+                try configureOutputUnit(sampleRate: outputRate, maximumFrames: outputFrames)
 
-            try check(AudioUnitInitialize(inputUnit!), "Initialize input HAL")
-            try check(AudioUnitInitialize(outputUnit!), "Initialize output HAL")
-            try check(AudioOutputUnitStart(inputUnit!), "Start input HAL")
-            try check(AudioOutputUnitStart(outputUnit!), "Start output HAL")
+                try check(AudioUnitInitialize(inputUnit!), "Initialize input HAL")
+                try check(AudioUnitInitialize(outputUnit!), "Initialize output HAL")
+                try check(AudioOutputUnitStart(inputUnit!), "Start input HAL")
+                try check(AudioOutputUnitStart(outputUnit!), "Start output HAL")
+            }
 
             diagnostics = Diagnostics(
                 inputDeviceName: deviceName(inputDevice),
@@ -112,7 +128,8 @@ final class HALAudioBridge {
                 inputBufferFrames: inputFrames,
                 outputBufferFrames: outputFrames,
                 bridgeTargetFrames: targetFrames,
-                sampleRate: inputRate
+                sampleRate: inputRate,
+                passthrough: passthrough
             )
         } catch {
             stop()
@@ -133,6 +150,7 @@ final class HALAudioBridge {
         }
         outputUnit = nil
         inputUnit = nil
+        isPassthrough = false
 
         if let ring {
             return_audio_ring_destroy(ring)
@@ -152,7 +170,7 @@ final class HALAudioBridge {
     }
 
     func runtimeStats() -> (
-        fill: UInt32, underflows: UInt64, overflows: UInt64,
+        fill: UInt32, target: UInt32, underflows: UInt64, overflows: UInt64,
         shortened: UInt64, stretched: UInt64,
         writeCalls: UInt64, writtenFrames: UInt64, renderCalls: UInt64, renderedFrames: UInt64,
         maximumWrite: UInt32, maximumRender: UInt32
@@ -160,6 +178,7 @@ final class HALAudioBridge {
         let stats = return_audio_ring_stats(ring)
         return (
             stats.fill_frames,
+            stats.target_frames,
             stats.underflows,
             stats.overflows,
             stats.shortened_reads,
@@ -197,9 +216,29 @@ final class HALAudioBridge {
         return noErr
     }
 
-    fileprivate func renderOutput(frameCount: UInt32, ioData: UnsafeMutablePointer<AudioBufferList>) -> OSStatus {
+    fileprivate func renderOutput(
+        timestamp: UnsafePointer<AudioTimeStamp>,
+        frameCount: UInt32,
+        ioData: UnsafeMutablePointer<AudioBufferList>
+    ) -> OSStatus {
         guard frameCount <= maximumFrames, let outputScratch, let ring else {
             return kAudio_ParamError
+        }
+
+        if isPassthrough, let outputUnit, let inputScratch {
+            var bufferList = AudioBufferList(
+                mNumberBuffers: 1,
+                mBuffers: AudioBuffer(
+                    mNumberChannels: 1,
+                    mDataByteSize: frameCount * UInt32(MemoryLayout<Float>.size),
+                    mData: inputScratch
+                )
+            )
+            var flags: AudioUnitRenderActionFlags = []
+            let status = AudioUnitRender(outputUnit, &flags, timestamp, 1, frameCount, &bufferList)
+            if status == noErr {
+                return_audio_ring_write(ring, inputScratch, frameCount)
+            }
         }
 
         return_audio_ring_render(ring, outputScratch, frameCount)
@@ -260,6 +299,36 @@ final class HALAudioBridge {
             AudioComponentInstanceDispose(unit)
             throw error
         }
+    }
+
+    private func configureDuplexUnit(
+        _ unit: AudioUnit,
+        sampleRate: Double,
+        maximumFrames: UInt32
+    ) throws {
+        var inputFormat = monoFloatFormat(sampleRate: sampleRate)
+        try setProperty(
+            unit, kAudioUnitProperty_StreamFormat, scope: kAudioUnitScope_Output,
+            element: 1, value: &inputFormat, operation: "Set duplex input format"
+        )
+        var outputFormat = stereoFloatFormat(sampleRate: sampleRate)
+        try setProperty(
+            unit, kAudioUnitProperty_StreamFormat, scope: kAudioUnitScope_Input,
+            element: 0, value: &outputFormat, operation: "Set duplex output format"
+        )
+        var callback = AURenderCallbackStruct(
+            inputProc: outputRenderCallback,
+            inputProcRefCon: Unmanaged.passUnretained(self).toOpaque()
+        )
+        try setProperty(
+            unit, kAudioUnitProperty_SetRenderCallback, scope: kAudioUnitScope_Input,
+            element: 0, value: &callback, operation: "Install duplex render callback"
+        )
+        var maximumFrames = maximumFrames
+        try setProperty(
+            unit, kAudioUnitProperty_MaximumFramesPerSlice, scope: kAudioUnitScope_Global,
+            element: 0, value: &maximumFrames, operation: "Set duplex slice size"
+        )
     }
 
     private func configureInputUnit(sampleRate: Double, maximumFrames: UInt32) throws {
@@ -364,7 +433,7 @@ final class HALAudioBridge {
         return status == noErr && device != kAudioObjectUnknown ? device : nil
     }
 
-    private func setBufferFrames(_ device: AudioDeviceID, preferredFrames: UInt32) throws -> UInt32 {
+    private func setBufferFrames(_ device: AudioDeviceID) throws -> UInt32 {
         if originalDeviceBufferFrames[device] == nil {
             originalDeviceBufferFrames[device] = deviceBufferFrames(device)
         }
@@ -382,7 +451,7 @@ final class HALAudioBridge {
         )
 
         var frames = UInt32(
-            min(max(Double(preferredFrames), range.mMinimum), range.mMaximum).rounded(.up)
+            min(max(range.mMinimum, 1), range.mMaximum).rounded(.up)
         )
         var frameAddress = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyBufferFrameSize,
